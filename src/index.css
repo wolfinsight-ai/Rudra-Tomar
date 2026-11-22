@@ -1,0 +1,50 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    background-color: #050507;
+    color: #F1F5F9;
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle horizontal scrollbar for deadline strip */
+.subtle-scroll::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+
+.subtle-scroll::-webkit-scrollbar-track {
+  background: #050507;
+}
+
+.subtle-scroll::-webkit-scrollbar-thumb {
+  background: rgba(29, 78, 216, 0.35);
+  border-radius: 3px;
+}
+
+.subtle-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 240, 255, 0.5);
+}

@@ -1,0 +1,6 @@
+{
+  "name": "VoltReg Intel",
+  "description": "B2B renewable energy regulatory and market intelligence platform with policy tracking, deadline alerts, watchlist persistence, and private company impact analysis.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
