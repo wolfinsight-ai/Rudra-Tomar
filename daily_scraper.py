@@ -1,144 +1,177 @@
+import json
 import os
-from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
+import re
 import requests
 from bs4 import BeautifulSoup
-from supabase import Client, create_client
+from google import genai
+from supabase import create_client
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in GitHub Secrets.")
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 }
 
-PORTALS = [
-    {
-        "name": "SECI Latest News",
-        "url": "https://www.seci.co.in/latest-news",
-        "authority": "SECI",
-        "state": "National",
-        "default_sector": "Storage/BESS",
-    },
-    {
-        "name": "MNRE Portal",
-        "url": "https://mnre.gov.in/",
-        "authority": "MNRE",
-        "state": "National",
-        "default_sector": "Solar",
-    },
-]
-
-KEYWORDS = [
-    "policy", "guideline", "tariff", "amendment", "notification",
-    "tender", "almm", "storage", "bess", "open access",
-    "solar", "wind", "hydrogen", "circular", "rpo", "rco"
-]
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
-def detect_sector(text: str, fallback: str) -> str:
-    t = text.lower()
-    if "bess" in t or "battery" in t or "storage" in t:
-        return "Storage/BESS"
-    if "hydrogen" in t:
-        return "Green Hydrogen"
-    if "wind" in t:
-        return "Wind"
-    if "tariff" in t or "open access" in t or "transmission" in t or "grid" in t:
-        return "Grid/Tariff"
-    if "solar" in t or "almm" in t or "rooftop" in t:
-        return "Solar"
-    return fallback
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
 
 
-def detect_impact(text: str) -> str:
-    t = text.lower()
-    if any(k in t for k in ["amendment", "tariff", "almm", "mandatory", "deadline", "bess", "storage"]):
-        return "High"
-    if any(k in t for k in ["guideline", "notification", "tender", "open access"]):
-        return "Medium"
-    return "Low"
+def fetch_existing_titles() -> set[str]:
+    res = supabase.table("policies").select("title").execute()
+    return {clean_text(row.get("title", "")).lower() for row in (res.data or []) if row.get("title")}
 
 
-def scrape_portals() -> list[dict]:
-    found: dict[str, dict] = {}
-    scanned_links = 0
+def scrape_renewable_energy() -> list[dict]:
+    items = []
+    sources = [
+        ("https://www.seci.co.in/latest-news", "SECI", "Tenders & Notifications"),
+        ("https://mnre.gov.in/", "MNRE", "Government Notifications"),
+    ]
+    keywords = ("solar", "wind", "hybrid", "bess", "storage", "green", "tariff", "rfs", "mnre", "seci", "policy", "guideline", "order")
 
-    for portal in PORTALS:
+    for url, authority, default_sector in sources:
         try:
-            res = requests.get(portal["url"], headers=HEADERS, timeout=25)
-            print(f"[{portal['name']}] HTTP {res.status_code}")
-            res.raise_for_status()
+            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seen_local = set()
 
-            soup = BeautifulSoup(res.text, "html.parser")
-            anchors = soup.find_all("a", href=True)
-            scanned_links += len(anchors)
-
-            for a in anchors:
-                title = " ".join(a.get_text().split())
-                href = a["href"].strip()
-                if len(title) < 12 or href.startswith("#") or href.lower().startswith("javascript:"):
+            for a in soup.find_all("a", href=True):
+                title = clean_text(a.get_text())
+                if len(title) < 25 or len(title) > 240:
                     continue
+                if not any(k in title.lower() for k in keywords):
+                    continue
+                if title.lower() in seen_local:
+                    continue
+                seen_local.add(title.lower())
 
-                full_url = urljoin(portal["url"], href)
-                is_pdf = ".pdf" in full_url.lower()
-                has_keyword = any(k in title.lower() or k in full_url.lower() for k in KEYWORDS)
+                href = a["href"].strip()
+                if not href.startswith("http"):
+                    base = "https://www.seci.co.in" if "seci.co.in" in url else "https://mnre.gov.in"
+                    href = f"{base}/{href.lstrip('/')}"
 
-                if is_pdf or has_keyword:
-                    clean_title = title[:240]
-                    sector = detect_sector(clean_title, portal["default_sector"])
-                    found[clean_title] = {
-                        "title": clean_title,
-                        "authority": portal["authority"],
-                        "state": portal["state"],
-                        "sector": sector,
-                        "impact_level": detect_impact(clean_title),
-                        "executive_summary": f"Official notice published on {portal['name']}: {clean_title}.",
-                        "business_impact": f"Review compliance rules, eligibility criteria, and commercial timelines in {sector}.",
-                        "market_outlook": f"Potential near-term procurement, tariff, or capacity shift across {sector} developers.",
-                        "source_pdf_url": full_url,
-                        "deadline_date": (datetime.now(timezone.utc) + timedelta(days=21)).isoformat(),
-                        "published_date": datetime.now(timezone.utc).isoformat(),
-                    }
-        except Exception as err:
-            print(f"[{portal['name']}] Scrape warning: {err}")
+                items.append({
+                    "title": title,
+                    "authority": authority,
+                    "sector": default_sector,
+                    "state": "All India",
+                    "status": "Active",
+                    "source_url": href,
+                    "domain": "renewable_energy",
+                })
+        except Exception as exc:
+            print(f"[Renewable] Warning scraping {url}: {exc}")
 
-    print(f"Scanned {scanned_links} links | Matched {len(found)} unique policy items.")
-    return list(found.values())[:25]
+    return items[:12]
+
+
+def scrape_plastic_recycling() -> list[dict]:
+    items = []
+    urls = [
+        "https://cpcb.nic.in/plastic-waste/",
+        "https://epr.cpcb.gov.in/",
+    ]
+    keywords = ("epr", "plastic", "pwm", "pibo", "pwp", "recycler", "waste", "notification", "guideline", "circular")
+
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=25)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            seen_local = set()
+
+            for a in soup.find_all("a", href=True):
+                title = clean_text(a.get_text())
+                if len(title) < 22 or len(title) > 240:
+                    continue
+                if not any(k in title.lower() for k in keywords):
+                    continue
+                if title.lower() in seen_local:
+                    continue
+                seen_local.add(title.lower())
+
+                href = a["href"].strip()
+                if not href.startswith("http"):
+                    base = "https://cpcb.nic.in" if "cpcb.nic.in" in url else "https://epr.cpcb.gov.in"
+                    href = f"{base}/{href.lstrip('/')}"
+
+                sector = "EPR Regulations" if "epr" in title.lower() else "Government Notifications"
+                items.append({
+                    "title": title,
+                    "authority": "CPCB",
+                    "sector": sector,
+                    "state": "All India",
+                    "status": "Active",
+                    "source_url": href,
+                    "domain": "plastic_recycling",
+                })
+        except Exception as exc:
+            print(f"[Plastic] Warning scraping {url}: {exc}")
+
+    return items[:12]
+
+
+def summarize_policy(item: dict) -> tuple[str, str]:
+    prompt = f"""
+You are a B2B regulatory intelligence analyst for Indian enterprises.
+Analyze this policy item:
+Domain: {item['domain']}
+Authority: {item['authority']}
+Title: {item['title']}
+Source URL: {item['source_url']}
+
+Return ONLY valid JSON with two keys:
+- "summary": 2 concise sentences explaining what this notification/rule covers in plain English.
+- "market_impact": 2 concise sentences explaining operational, compliance, or commercial impact for businesses (for renewable_energy: developers, IPPs, EPCs, utilities; for plastic_recycling: PIBOs, recyclers/PWPs, packaging manufacturers).
+"""
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+        )
+        raw = (response.text or "").strip()
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
+        parsed = json.loads(raw)
+        summary = clean_text(parsed.get("summary", "")) or item["title"]
+        market_impact = clean_text(parsed.get("market_impact", "")) or "Review official circular for compliance requirements and timelines."
+        return summary, market_impact
+    except Exception as exc:
+        print(f"[Gemini] Fallback summary for '{item['title']}': {exc}")
+        return (
+            f"Official update issued by {item['authority']} regarding {item['title']}.",
+            "Check official notification details to assess compliance deadlines and operational impact.",
+        )
 
 
 def run():
-    candidates = scrape_portals()
-    if not candidates:
-        print("No policy candidates matched in this run.")
-        return
-
-    existing = supabase.table("policies").select("title").execute()
-    existing_titles = {r["title"] for r in (existing.data or []) if r.get("title")}
-
+    existing_titles = fetch_existing_titles()
+    candidates = scrape_renewable_energy() + scrape_plastic_recycling()
     inserted = 0
-    for item in candidates:
-        if item["title"] in existing_titles:
-            continue
-        try:
-            supabase.table("policies").insert(item).execute()
-            existing_titles.add(item["title"])
-            inserted += 1
-            print(f"Inserted: {item['title']}")
-        except Exception as err:
-            print(f"Insert error for '{item['title']}': {err}")
 
-    print(f"Sync finished. Inserted {inserted} new policies.")
+    for item in candidates:
+        key = clean_text(item["title"]).lower()
+        if key in existing_titles:
+            continue
+
+        summary, market_impact = summarize_policy(item)
+        row = {
+            **item,
+            "summary": summary,
+            "market_impact": market_impact,
+        }
+        supabase.table("policies").insert(row).execute()
+        existing_titles.add(key)
+        inserted += 1
+        print(f"Inserted [{item['domain']}]: {item['title']}")
+
+    print(f"Sync complete. New policies inserted: {inserted}")
 
 
 if __name__ == "__main__":
